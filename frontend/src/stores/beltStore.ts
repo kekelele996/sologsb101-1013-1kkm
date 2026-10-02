@@ -5,6 +5,7 @@
 import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
 import { db, createId, watchTable } from '@/utils/db'
+import { useSyncStore } from '@/stores/syncStore'
 import type { Belt, BeltDraft, Orientation } from '@/types/belt'
 import { ORIENTATIONS, createEmptyBeltDraft } from '@/types/belt'
 
@@ -17,6 +18,7 @@ export const ORIENTATION_ORDER: Record<Orientation, number> = {
 }
 
 export const useBeltStore = defineStore('belt', () => {
+  const syncStore = useSyncStore()
   const belts = ref<Belt[]>([])
   const ready = ref(false)
   const error = ref<string | null>(null)
@@ -105,26 +107,39 @@ export const useBeltStore = defineStore('belt', () => {
     const now = Date.now()
     const row: Belt = { ...payload, siteId, id: createId('belt'), createdAt: now, updatedAt: now }
     await db.belts.put(row)
+    // 外业写入入队：断网也照旧记账，网络恢复后按样带编号与分级组对账
+    void syncStore.enqueue('belt', row.id, row.id, 'create', row, null).catch(() => {})
     return row
   }
 
   async function updateBelt(id: string, patch: Partial<Belt>): Promise<void> {
+    const prev = await db.belts.get(id)
     await db.belts.update(id, { ...patch, updatedAt: Date.now() } as never)
+    const next = await db.belts.get(id)
+    // 已定级样带被外业改动 → 对账时转待复核，分级份不被覆盖
+    void syncStore.enqueue('belt', id, id, 'update', next ?? null, prev ?? null).catch(() => {})
   }
 
   /** 删除样带：级联删除其珊瑚记录与鱼类计数 */
   async function removeBelt(id: string): Promise<void> {
+    const prev = await db.belts.get(id)
+    const keys = prev
+      ? await syncStore.resolveBeltKeys(id)
+      : undefined
     await db.transaction('rw', [db.belts, db.corals, db.fishes], async () => {
       await db.corals.where('beltId').equals(id).delete()
       await db.fishes.where('beltId').equals(id).delete()
       await db.belts.delete(id)
     })
+    // 样带删除入队（预解析业务键）；已定级样带删除 → 待人工定论
+    void syncStore.enqueue('belt', id, id, 'delete', null, prev ?? null, keys).catch(() => {})
     if (currentBeltId.value === id) selectBelt(null)
   }
 
   /** 批量改写朝向（同站位多条样带统一方向） */
   async function bulkSetOrientation(ids: string[], orientation: Orientation): Promise<number> {
     const now = Date.now()
+    const prevs = await db.belts.where('id').anyOf(ids).toArray()
     await db.belts
       .where('id')
       .anyOf(ids)
@@ -132,6 +147,11 @@ export const useBeltStore = defineStore('belt', () => {
         belt.orientation = orientation
         belt.updatedAt = now
       })
+    const nexts = await db.belts.where('id').anyOf(ids).toArray()
+    for (const next of nexts) {
+      const prev = prevs.find((item) => item.id === next.id)
+      void syncStore.enqueue('belt', next.id, next.id, 'update', next, prev ?? null).catch(() => {})
+    }
     return ids.length
   }
 

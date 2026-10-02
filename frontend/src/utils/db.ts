@@ -5,15 +5,17 @@
  * - 首次打开自动播种互相引用的演示数据（礁区 → 站位 → 样带 → 珊瑚记录/鱼类计数）
  * - 纯前端应用：不依赖任何后端服务或数据库服务
  */
-import Dexie, { liveQuery, type Table } from 'dexie'
+import Dexie, { liveQuery, type Table, type Transaction } from 'dexie'
 import type { Reef } from '@/types/reef'
 import type { Site } from '@/types/site'
 import type { Belt } from '@/types/belt'
 import type { CoralRecord } from '@/types/coralRecord'
 import type { FishCount } from '@/types/fishCount'
+import type { BleachGrade, OutboxEntry, ReefConclusion, ReconcileIssue } from '@/types/sync'
+import { bleachGrade, bleachIndex, coralCoveragePct, round } from '@/utils/bleach'
 
 /** 当前数据结构版本号：每次调整字段结构必须 +1 并补迁移 */
-export const DB_VERSION = 2
+export const DB_VERSION = 3
 
 /** 数据库名（浏览器 IndexedDB 中的库名） */
 export const DB_NAME = 'gbcoralbelt'
@@ -35,6 +37,14 @@ export interface BackupPayload {
   belts: Belt[]
   corals: CoralRecord[]
   fishes: FishCount[]
+  /** 外业待同步队列（外业份） */
+  outbox: OutboxEntry[]
+  /** 分级组定级记录（分级份） */
+  bleachGrades: BleachGrade[]
+  /** 礁区结论（分级份） */
+  reefConclusions: ReefConclusion[]
+  /** 对账问题（待复核 / 对账不符，留人工定论） */
+  reconcileIssues: ReconcileIssue[]
 }
 
 export class CoralBeltDatabase extends Dexie {
@@ -43,6 +53,14 @@ export class CoralBeltDatabase extends Dexie {
   belts!: Table<Belt, string>
   corals!: Table<CoralRecord, string>
   fishes!: Table<FishCount, string>
+  /** 外业待同步队列 */
+  outbox!: Table<OutboxEntry, string>
+  /** 分级组定级记录（分级份） */
+  bleachGrades!: Table<BleachGrade, string>
+  /** 礁区结论（分级份） */
+  reefConclusions!: Table<ReefConclusion, string>
+  /** 对账问题（待人工定论） */
+  reconcileIssues!: Table<ReconcileIssue, string>
 
   constructor() {
     super(DB_NAME)
@@ -57,7 +75,7 @@ export class CoralBeltDatabase extends Dexie {
     })
 
     // v2：补齐筛选与统计需要的索引（位置/面积、经纬度/水深、样带长度与朝向、白化等级、类别）
-    this.version(DB_VERSION)
+    this.version(2)
       .stores({
         reefs: 'id, name, location, protectStatus, areaKm2, manager, updatedAt',
         sites: 'id, reefId, no, lat, lng, depthM, substrate, updatedAt',
@@ -86,6 +104,24 @@ export class CoralBeltDatabase extends Dexie {
             })
         }
       })
+
+    // v3：外业份与分级份各自持有自己那份。新增待同步队列、分级定级、礁区结论与对账问题表；
+    // 升级时把历史数据补录为分级份（补结论、判定级），外业份数据保持不变。
+    this.version(DB_VERSION)
+      .stores({
+        reefs: 'id, name, location, protectStatus, areaKm2, manager, updatedAt',
+        sites: 'id, reefId, no, lat, lng, depthM, substrate, updatedAt',
+        belts: 'id, siteId, no, lengthM, orientation, surveyDate, observer, updatedAt',
+        corals: 'id, beltId, genus, form, coverCm, bleachLevel, updatedAt',
+        fishes: 'id, beltId, family, count, sizeClass, category, updatedAt',
+        outbox: 'id, entityType, entityId, beltId, beltNo, siteNo, status, createdAt',
+        bleachGrades: 'id, beltId, beltNo, reefId, bleachLevel, gradedAt',
+        reefConclusions: 'id, reefId, updatedAt',
+        reconcileIssues: 'id, type, status, beltId, beltNo, reefId, createdAt'
+      })
+      .upgrade(async (tx) => {
+        await backfillGradingCopies(tx)
+      })
   }
 }
 
@@ -108,6 +144,116 @@ export function watchTable<T>(table: () => Table<T, string>): { subscribe: (cb: 
       })
       return () => subscription.unsubscribe()
     }
+  }
+}
+
+/* ------------------------------ v3 迁移：补录分级份 ------------------------------ */
+
+/**
+ * 旧数据升级时补结论、判定级：
+ * 把历史上「外业份与分级份共用一条记录」时期的数据，按样带补录为分级组定级（bleachGrades），
+ * 按礁区补录礁区结论（reefConclusions）。外业份（belts / corals）原样保留，不覆盖、不删除。
+ * 幂等：分级份已有记录时跳过。
+ */
+async function backfillGradingCopies(tx: Transaction): Promise<void> {
+  const gradeTable = tx.table('bleachGrades')
+  const conclusionTable = tx.table('reefConclusions')
+  const existingGrades = await gradeTable.count()
+  const existingConclusions = await conclusionTable.count()
+  if (existingGrades > 0 && existingConclusions > 0) return
+
+  const reefs = (await tx.table('reefs').toArray()) as Reef[]
+  const sites = (await tx.table('sites').toArray()) as Site[]
+  const belts = (await tx.table('belts').toArray()) as Belt[]
+  const corals = (await tx.table('corals').toArray()) as CoralRecord[]
+  const now = Date.now()
+
+  const siteById = new Map(sites.map((site) => [site.id, site]))
+  const coralsByBelt = new Map<string, CoralRecord[]>()
+  corals.forEach((coral) => {
+    const list = coralsByBelt.get(coral.beltId) ?? []
+    list.push(coral)
+    coralsByBelt.set(coral.beltId, list)
+  })
+
+  // 按样带补录分级定级
+  if (existingGrades === 0) {
+    const grades: BleachGrade[] = []
+    for (const belt of belts) {
+      const beltCorals = coralsByBelt.get(belt.id) ?? []
+      if (beltCorals.length === 0) continue
+      const site = siteById.get(belt.siteId)
+      const index = bleachIndex(beltCorals)
+      const level = bleachGrade(index)
+      const coverTotal = round(
+        beltCorals.reduce((sum, coral) => sum + coral.coverCm, 0),
+        1
+      )
+      grades.push({
+        id: createId('grd'),
+        beltId: belt.id,
+        beltNo: belt.no,
+        reefId: site?.reefId ?? '',
+        bleachLevel: level,
+        conclusion: `升级补录：珊瑚覆盖率 ${coralCoveragePct(coverTotal, belt.lengthM)}%，白化指数 ${index}（${level}）`,
+        coverSnapshot: JSON.stringify(
+          beltCorals.map((coral) => ({
+            genus: coral.genus,
+            form: coral.form,
+            coverCm: coral.coverCm,
+            remark: coral.remark
+          }))
+        ),
+        beltSnapshot: JSON.stringify({
+          no: belt.no,
+          lengthM: belt.lengthM,
+          orientation: belt.orientation,
+          surveyDate: belt.surveyDate,
+          observer: belt.observer
+        }),
+        gradedBy: '系统补录',
+        gradedAt: belt.updatedAt || now,
+        updatedAt: now
+      })
+    }
+    if (grades.length > 0) await gradeTable.bulkPut(grades)
+  }
+
+  // 按礁区补录结论
+  if (existingConclusions === 0) {
+    const conclusions: ReefConclusion[] = reefs.map((reef) => {
+      const reefSiteIds = new Set(sites.filter((site) => site.reefId === reef.id).map((site) => site.id))
+      const reefBelts = belts.filter((belt) => reefSiteIds.has(belt.siteId))
+      const reefBeltIds = new Set(reefBelts.map((belt) => belt.id))
+      const reefCorals = corals.filter((coral) => reefBeltIds.has(coral.beltId))
+      const coverTotal = round(
+        reefCorals.reduce((sum, coral) => sum + coral.coverCm, 0),
+        1
+      )
+      const avgIndex =
+        reefBelts.length === 0
+          ? 0
+          : round(
+              reefBelts.reduce((sum, belt) => {
+                const list = coralsByBelt.get(belt.id) ?? []
+                return sum + bleachIndex(list)
+              }, 0) / reefBelts.length,
+              2
+            )
+      const level = bleachGrade(avgIndex)
+      const conclusion =
+        reefBelts.length === 0
+          ? `升级补录：礁区「${reef.name}」暂无样带与珊瑚记录，待外业开展普查后出具结论。`
+          : `升级补录：礁区「${reef.name}」共 ${reefSiteIds.size} 个站位、${reefBelts.length} 条样带，珊瑚覆盖率 ${coralCoveragePct(coverTotal, reefBelts.reduce((sum, belt) => sum + belt.lengthM, 0))}%，平均白化指数 ${avgIndex}（${level}）。`
+      return {
+        id: createId('rcc'),
+        reefId: reef.id,
+        conclusion,
+        updatedBy: '系统补录',
+        updatedAt: now
+      }
+    })
+    if (conclusions.length > 0) await conclusionTable.bulkPut(conclusions)
   }
 }
 
@@ -355,9 +501,23 @@ export async function initDatabase(): Promise<void> {
 
 /** 清空全部业务表（导入覆盖与重置共用） */
 export async function clearAllTables(): Promise<void> {
-  await db.transaction('rw', [db.reefs, db.sites, db.belts, db.corals, db.fishes], async () => {
-    await Promise.all([db.reefs.clear(), db.sites.clear(), db.belts.clear(), db.corals.clear(), db.fishes.clear()])
-  })
+  await db.transaction(
+    'rw',
+    [db.reefs, db.sites, db.belts, db.corals, db.fishes, db.outbox, db.bleachGrades, db.reefConclusions, db.reconcileIssues],
+    async () => {
+      await Promise.all([
+        db.reefs.clear(),
+        db.sites.clear(),
+        db.belts.clear(),
+        db.corals.clear(),
+        db.fishes.clear(),
+        db.outbox.clear(),
+        db.bleachGrades.clear(),
+        db.reefConclusions.clear(),
+        db.reconcileIssues.clear()
+      ])
+    }
+  )
 }
 
 /** 清空并重新播种演示数据 */
@@ -368,14 +528,19 @@ export async function resetDatabase(): Promise<void> {
 
 /** 统计各表行数，供页脚概览与覆盖度页展示 */
 export async function countAll(): Promise<Record<string, number>> {
-  const [reefs, sites, belts, corals, fishes] = await Promise.all([
-    db.reefs.count(),
-    db.sites.count(),
-    db.belts.count(),
-    db.corals.count(),
-    db.fishes.count()
-  ])
-  return { reefs, sites, belts, corals, fishes }
+  const [reefs, sites, belts, corals, fishes, outbox, bleachGrades, reefConclusions, reconcileIssues] =
+    await Promise.all([
+      db.reefs.count(),
+      db.sites.count(),
+      db.belts.count(),
+      db.corals.count(),
+      db.fishes.count(),
+      db.outbox.count(),
+      db.bleachGrades.count(),
+      db.reefConclusions.count(),
+      db.reconcileIssues.count()
+    ])
+  return { reefs, sites, belts, corals, fishes, outbox, bleachGrades, reefConclusions, reconcileIssues }
 }
 
 /** 写入结构版本号到 localStorage，便于覆盖度页比对 */

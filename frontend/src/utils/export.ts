@@ -18,20 +18,35 @@ import {
 import { bleachGrade, bleachIndex, bleachedSharePct, coralCoveragePct, fishDensity, round } from '@/utils/bleach'
 
 /** 备份集合键名 */
-export const BACKUP_KEYS = ['reefs', 'sites', 'belts', 'corals', 'fishes'] as const
+export const BACKUP_KEYS = [
+  'reefs',
+  'sites',
+  'belts',
+  'corals',
+  'fishes',
+  'outbox',
+  'bleachGrades',
+  'reefConclusions',
+  'reconcileIssues'
+] as const
 export type BackupKey = (typeof BACKUP_KEYS)[number]
 
 export type CountMap = Record<BackupKey, number>
 
 /** 组装当前本地数据的完整快照 */
 export async function buildBackupPayload(): Promise<BackupPayload> {
-  const [reefs, sites, belts, corals, fishes] = await Promise.all([
-    db.reefs.toArray(),
-    db.sites.toArray(),
-    db.belts.toArray(),
-    db.corals.toArray(),
-    db.fishes.toArray()
-  ])
+  const [reefs, sites, belts, corals, fishes, outbox, bleachGrades, reefConclusions, reconcileIssues] =
+    await Promise.all([
+      db.reefs.toArray(),
+      db.sites.toArray(),
+      db.belts.toArray(),
+      db.corals.toArray(),
+      db.fishes.toArray(),
+      db.outbox.toArray(),
+      db.bleachGrades.toArray(),
+      db.reefConclusions.toArray(),
+      db.reconcileIssues.toArray()
+    ])
   return {
     app: 'gbcoralbelt',
     dbVersion: DB_VERSION,
@@ -40,7 +55,11 @@ export async function buildBackupPayload(): Promise<BackupPayload> {
     sites,
     belts,
     corals,
-    fishes
+    fishes,
+    outbox,
+    bleachGrades,
+    reefConclusions,
+    reconcileIssues
   }
 }
 
@@ -54,7 +73,9 @@ export function validateBackup(input: unknown): { ok: boolean; errors: string[];
   if (obj.app !== undefined && obj.app !== 'gbcoralbelt') {
     errors.push('app 字段应为 gbcoralbelt，文件来源不明')
   }
-  for (const key of BACKUP_KEYS) {
+  // 核心五表为必备字段；同步相关四表为 v3 新增，旧备份缺省时补空数组
+  const coreKeys: BackupKey[] = ['reefs', 'sites', 'belts', 'corals', 'fishes']
+  for (const key of coreKeys) {
     if (!Array.isArray(obj[key])) errors.push(`${key} 字段缺失或不是数组`)
   }
   if (errors.length > 0) return { ok: false, errors, payload: null }
@@ -66,7 +87,11 @@ export function validateBackup(input: unknown): { ok: boolean; errors: string[];
     sites: obj.sites ?? [],
     belts: obj.belts ?? [],
     corals: obj.corals ?? [],
-    fishes: obj.fishes ?? []
+    fishes: obj.fishes ?? [],
+    outbox: obj.outbox ?? [],
+    bleachGrades: obj.bleachGrades ?? [],
+    reefConclusions: obj.reefConclusions ?? [],
+    reconcileIssues: obj.reconcileIssues ?? []
   }
   return { ok: true, errors, payload }
 }
@@ -78,7 +103,11 @@ export function countPayload(payload: BackupPayload): CountMap {
     sites: payload.sites.length,
     belts: payload.belts.length,
     corals: payload.corals.length,
-    fishes: payload.fishes.length
+    fishes: payload.fishes.length,
+    outbox: payload.outbox.length,
+    bleachGrades: payload.bleachGrades.length,
+    reefConclusions: payload.reefConclusions.length,
+    reconcileIssues: payload.reconcileIssues.length
   }
 }
 
@@ -114,13 +143,31 @@ export function readFileText(file: File): Promise<string> {
 /** 导入快照：overwrite=true 先清空全部表，否则按主键合并 */
 export async function importBackup(payload: BackupPayload, overwrite: boolean): Promise<CountMap> {
   if (overwrite) await clearAllTables()
-  await db.transaction('rw', [db.reefs, db.sites, db.belts, db.corals, db.fishes], async () => {
-    await db.reefs.bulkPut(payload.reefs)
-    await db.sites.bulkPut(payload.sites)
-    await db.belts.bulkPut(payload.belts)
-    await db.corals.bulkPut(payload.corals)
-    await db.fishes.bulkPut(payload.fishes)
-  })
+  await db.transaction(
+    'rw',
+    [
+      db.reefs,
+      db.sites,
+      db.belts,
+      db.corals,
+      db.fishes,
+      db.outbox,
+      db.bleachGrades,
+      db.reefConclusions,
+      db.reconcileIssues
+    ],
+    async () => {
+      await db.reefs.bulkPut(payload.reefs)
+      await db.sites.bulkPut(payload.sites)
+      await db.belts.bulkPut(payload.belts)
+      await db.corals.bulkPut(payload.corals)
+      await db.fishes.bulkPut(payload.fishes)
+      await db.outbox.bulkPut(payload.outbox)
+      await db.bleachGrades.bulkPut(payload.bleachGrades)
+      await db.reefConclusions.bulkPut(payload.reefConclusions)
+      await db.reconcileIssues.bulkPut(payload.reconcileIssues)
+    }
+  )
   return countPayload(payload)
 }
 
@@ -155,7 +202,44 @@ export function remapIds(payload: BackupPayload): BackupPayload {
     id: createId('fsh'),
     beltId: beltMap.get(fish.beltId) ?? fish.beltId
   }))
-  return { ...payload, reefs, sites, belts, corals, fishes }
+  // 同步相关四表：重分配 id 并重映射外键，避免追加导入后与现有档案错位
+  const outbox = payload.outbox.map((entry) => ({
+    ...entry,
+    id: createId('obx'),
+    beltId: beltMap.get(entry.beltId) ?? entry.beltId,
+    reefId: reefMap.get(entry.reefId) ?? entry.reefId,
+    entityId:
+      entry.entityType === 'belt' ? beltMap.get(entry.entityId) ?? entry.entityId : entry.entityId
+  }))
+  const bleachGrades = payload.bleachGrades.map((grade) => ({
+    ...grade,
+    id: createId('grd'),
+    beltId: beltMap.get(grade.beltId) ?? grade.beltId,
+    reefId: reefMap.get(grade.reefId) ?? grade.reefId
+  }))
+  const reefConclusions = payload.reefConclusions.map((conclusion) => ({
+    ...conclusion,
+    id: createId('rcc'),
+    reefId: reefMap.get(conclusion.reefId) ?? conclusion.reefId
+  }))
+  const reconcileIssues = payload.reconcileIssues.map((issue) => ({
+    ...issue,
+    id: createId('iss'),
+    beltId: beltMap.get(issue.beltId) ?? issue.beltId,
+    reefId: reefMap.get(issue.reefId) ?? issue.reefId
+  }))
+  return {
+    ...payload,
+    reefs,
+    sites,
+    belts,
+    corals,
+    fishes,
+    outbox,
+    bleachGrades,
+    reefConclusions,
+    reconcileIssues
+  }
 }
 
 /** 白化等级分布：各等级累计覆盖长度 */

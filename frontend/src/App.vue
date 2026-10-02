@@ -5,10 +5,11 @@
  */
 import { computed, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { DataLine, Files, Grid, Odometer, PieChart } from '@element-plus/icons-vue'
+import { DataLine, Files, Grid, Odometer, PieChart, RefreshRight } from '@element-plus/icons-vue'
 import { useReefStore } from '@/stores/reefStore'
 import { useBeltStore } from '@/stores/beltStore'
 import { useSurveyStore } from '@/stores/surveyStore'
+import { useSyncStore } from '@/stores/syncStore'
 import { DB_NAME, DB_VERSION } from '@/utils/db'
 
 const route = useRoute()
@@ -16,11 +17,13 @@ const router = useRouter()
 const reefStore = useReefStore()
 const beltStore = useBeltStore()
 const surveyStore = useSurveyStore()
+const syncStore = useSyncStore()
 
 onMounted(() => {
   reefStore.start()
   beltStore.start()
   surveyStore.start()
+  syncStore.start()
 })
 
 /** 层级路由统一归属到最上层导航项 */
@@ -31,9 +34,15 @@ const activeKey = computed(() => {
   return route.path
 })
 
+const syncBadge = computed(() => {
+  const count = syncStore.openIssueCount + syncStore.failedCount + syncStore.pendingCount
+  return count > 0 ? String(count) : ''
+})
+
 const navItems = computed(() => [
   { key: '/reefs', label: '礁区台账', icon: Odometer, badge: String(reefStore.reefs.length) },
-  { key: '/coverage', label: '覆盖度汇总', icon: PieChart, badge: String(surveyStore.corals.length) }
+  { key: '/coverage', label: '覆盖度汇总', icon: PieChart, badge: String(surveyStore.corals.length) },
+  { key: '/sync', label: '同步对账', icon: RefreshRight, badge: syncBadge.value }
 ])
 
 /** 当前上下文的快捷入口：礁区 → 站位 → 样带 → 珊瑚/鱼类 */
@@ -87,6 +96,10 @@ function go(path: string): void {
           <em v-if="item.badge" class="app-nav__badge">{{ item.badge }}</em>
         </button>
       </nav>
+      <div class="app-online" :class="{ 'is-online': syncStore.online }">
+        <span class="app-online__dot" />
+        {{ syncStore.online ? '在线 · 可对账' : '断网 · 记账中' }}
+      </div>
     </header>
 
     <div v-if="contextLinks.length > 0" class="app-context">
@@ -199,6 +212,31 @@ function go(path: string): void {
   padding: 0 6px;
   border-radius: 8px;
   background: rgba(0, 0, 0, 0.18);
+}
+
+.app-online {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 12px;
+  border: 1px solid rgba(255, 255, 255, 0.22);
+  border-radius: 999px;
+  background: rgba(0, 0, 0, 0.18);
+  color: rgba(234, 250, 247, 0.85);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.app-online__dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #95a5a6;
+}
+
+.app-online.is-online .app-online__dot {
+  background: #7bed9f;
+  box-shadow: 0 0 6px rgba(123, 237, 159, 0.8);
 }
 
 .app-context {

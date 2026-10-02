@@ -5,6 +5,7 @@
 import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
 import { db, createId, watchTable } from '@/utils/db'
+import { useSyncStore } from '@/stores/syncStore'
 import type { BleachLevel, CoralForm, CoralRecord } from '@/types/coralRecord'
 import { BLEACH_LEVELS } from '@/types/coralRecord'
 import type { CountCategory, FishCount, SizeClass } from '@/types/fishCount'
@@ -48,6 +49,14 @@ export interface CoverageSummaryRow {
   coveragePct: number
   bleachIndex: number
   grade: BleachLevel
+  /** 分级组权威等级（已定级时覆盖外业初算等级） */
+  officialGrade: BleachLevel
+  /** 是否已经分级组定级 */
+  graded: boolean
+  /** 等级来源：grading 分级份 / field 外业初算 */
+  gradeSource: 'grading' | 'field'
+  /** 待复核 / 对账不符问题类型（外业改动与分级份对不上） */
+  openIssueType: 'graded_belt_modified' | 'grade_conflict' | null
   bleachedSharePct: number
   distribution: Record<BleachLevel, number>
   fishTotal: number
@@ -56,6 +65,7 @@ export interface CoverageSummaryRow {
 }
 
 export const useSurveyStore = defineStore('survey', () => {
+  const syncStore = useSyncStore()
   const corals = ref<CoralRecord[]>([])
   const fishes = ref<FishCount[]>([])
   const reefs = ref<Reef[]>([])
@@ -158,6 +168,9 @@ export const useSurveyStore = defineStore('survey', () => {
         })
         const index = bleachIndex(beltCorals)
         const fishTotal = beltFishes.filter((fish) => fish.category === '鱼类').reduce((sum, fish) => sum + fish.count, 0)
+        // 分级份权威等级：分级组已定级则以分级份为准，否则用外业覆盖初算等级
+        const gradeRecord = syncStore.gradeForBelt(belt.id)
+        const openIssue = syncStore.openIssueForBelt(belt.id)
         return {
           beltId: belt.id,
           beltNo: belt.no,
@@ -174,6 +187,14 @@ export const useSurveyStore = defineStore('survey', () => {
           coveragePct: coralCoveragePct(coverCmTotal, belt.lengthM),
           bleachIndex: index,
           grade: bleachGrade(index),
+          /** 分级组权威等级（已定级时覆盖外业初算等级） */
+          officialGrade: gradeRecord ? gradeRecord.bleachLevel : bleachGrade(index),
+          /** 是否已经分级组定级 */
+          graded: !!gradeRecord,
+          /** 等级来源：grading 分级份 / field 外业初算 */
+          gradeSource: gradeRecord ? ('grading' as const) : ('field' as const),
+          /** 待复核 / 对账不符问题（外业改动与分级份对不上） */
+          openIssueType: openIssue?.type ?? null,
           bleachedSharePct: bleachedSharePct(beltCorals),
           distribution,
           fishTotal,
@@ -261,15 +282,25 @@ export const useSurveyStore = defineStore('survey', () => {
     const now = Date.now()
     const row: CoralRecord = { ...payload, beltId, id: createId('cor'), createdAt: now, updatedAt: now }
     await db.corals.put(row)
+    // 外业覆盖记录入队：断网也照旧记账，网络恢复后按样带编号与分级组对账
+    void syncStore.enqueue('coral', row.id, beltId, 'create', row, null).catch(() => {})
     return row
   }
 
   async function updateCoral(id: string, patch: Partial<CoralRecord>): Promise<void> {
+    const prev = await db.corals.get(id)
     await db.corals.update(id, { ...patch, updatedAt: Date.now() } as never)
+    const next = await db.corals.get(id)
+    // 已定级样带的覆盖被外业改动 → 对账不符，分级份不被覆盖
+    void syncStore
+      .enqueue('coral', id, prev?.beltId ?? next?.beltId ?? '', 'update', next ?? null, prev ?? null)
+      .catch(() => {})
   }
 
   async function removeCoral(id: string): Promise<void> {
+    const prev = await db.corals.get(id)
     await db.corals.delete(id)
+    void syncStore.enqueue('coral', id, prev?.beltId ?? '', 'delete', null, prev ?? null).catch(() => {})
   }
 
   /** 批量导入粘贴行（替换该样带原有珊瑚记录） */
@@ -293,12 +324,17 @@ export const useSurveyStore = defineStore('survey', () => {
       await db.corals.where('beltId').equals(beltId).delete()
       if (records.length > 0) await db.corals.bulkPut(records)
     })
+    // 批量覆盖入队：已定级样带 → 对账不符；未定级 → 正常投递
+    for (const record of records) {
+      void syncStore.enqueue('coral', record.id, beltId, 'create', record, null).catch(() => {})
+    }
     return records.length
   }
 
   /** 批量改写白化等级 */
   async function bulkSetBleachLevel(ids: string[], bleachLevel: BleachLevel): Promise<number> {
     const now = Date.now()
+    const prevs = await db.corals.where('id').anyOf(ids).toArray()
     await db.corals
       .where('id')
       .anyOf(ids)
@@ -306,6 +342,11 @@ export const useSurveyStore = defineStore('survey', () => {
         coral.bleachLevel = bleachLevel
         coral.updatedAt = now
       })
+    const nexts = await db.corals.where('id').anyOf(ids).toArray()
+    for (const next of nexts) {
+      const prev = prevs.find((item) => item.id === next.id)
+      void syncStore.enqueue('coral', next.id, next.beltId, 'update', next, prev ?? null).catch(() => {})
+    }
     return ids.length
   }
 
@@ -318,15 +359,23 @@ export const useSurveyStore = defineStore('survey', () => {
     const now = Date.now()
     const row: FishCount = { ...payload, beltId, id: createId('fsh'), createdAt: now, updatedAt: now }
     await db.fishes.put(row)
+    void syncStore.enqueue('fish', row.id, beltId, 'create', row, null).catch(() => {})
     return row
   }
 
   async function updateFish(id: string, patch: Partial<FishCount>): Promise<void> {
+    const prev = await db.fishes.get(id)
     await db.fishes.update(id, { ...patch, updatedAt: Date.now() } as never)
+    const next = await db.fishes.get(id)
+    void syncStore
+      .enqueue('fish', id, prev?.beltId ?? next?.beltId ?? '', 'update', next ?? null, prev ?? null)
+      .catch(() => {})
   }
 
   async function removeFish(id: string): Promise<void> {
+    const prev = await db.fishes.get(id)
     await db.fishes.delete(id)
+    void syncStore.enqueue('fish', id, prev?.beltId ?? '', 'delete', null, prev ?? null).catch(() => {})
   }
 
   /** 批量导入粘贴行（替换该样带原有计数） */
@@ -349,6 +398,9 @@ export const useSurveyStore = defineStore('survey', () => {
       await db.fishes.where('beltId').equals(beltId).delete()
       if (records.length > 0) await db.fishes.bulkPut(records)
     })
+    for (const record of records) {
+      void syncStore.enqueue('fish', record.id, beltId, 'create', record, null).catch(() => {})
+    }
     return records.length
   }
 

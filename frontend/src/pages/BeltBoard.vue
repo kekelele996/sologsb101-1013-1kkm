@@ -11,10 +11,12 @@ import { Delete, Edit, Plus, Right, Warning } from '@element-plus/icons-vue'
 import StatBadge from '@/components/common/StatBadge.vue'
 import EmptyPanel from '@/components/common/EmptyPanel.vue'
 import BleachTag from '@/components/common/BleachTag.vue'
+import SyncBadge from '@/components/common/SyncBadge.vue'
 import RouteMissingPanel from '@/components/common/RouteMissingPanel.vue'
 import { useReefStore } from '@/stores/reefStore'
 import { ORIENTATION_ORDER, useBeltStore } from '@/stores/beltStore'
 import { useSurveyStore } from '@/stores/surveyStore'
+import { useSyncStore } from '@/stores/syncStore'
 import { BELT_LENGTH_PRESETS, ORIENTATIONS } from '@/types/belt'
 import type { Belt, Orientation } from '@/types/belt'
 import { bleachGrade, bleachIndex, coralCoveragePct, fishDensity } from '@/utils/bleach'
@@ -25,6 +27,7 @@ const router = useRouter()
 const reefStore = useReefStore()
 const beltStore = useBeltStore()
 const surveyStore = useSurveyStore()
+const syncStore = useSyncStore()
 
 const siteId = computed(() => String(route.params.id ?? ''))
 const site = computed(() => reefStore.siteById(siteId.value))
@@ -305,6 +308,11 @@ onMounted(() => {
           <template #default="{ row }">
             <BleachTag :level="row.grade" size="small" />
             <div class="gb-hint gb-mono">指数 {{ row.bleachIndex }}</div>
+          </template>
+        </el-table-column>
+        <el-table-column label="对账状态" width="140">
+          <template #default="{ row }">
+            <SyncBadge :state="syncStore.beltSyncState(row.belt.id)" size="small" />
           </template>
         </el-table-column>
         <el-table-column label="操作" width="260" fixed="right">

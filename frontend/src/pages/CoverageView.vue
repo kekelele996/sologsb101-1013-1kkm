@@ -15,8 +15,10 @@ import { buildQuery, queryToArray, queryToBool } from '@/types/filter'
 import BleachTag from '@/components/common/BleachTag.vue'
 import StatBadge from '@/components/common/StatBadge.vue'
 import EmptyPanel from '@/components/common/EmptyPanel.vue'
+import SyncBadge from '@/components/common/SyncBadge.vue'
 import { useReefStore } from '@/stores/reefStore'
 import { useSurveyStore } from '@/stores/surveyStore'
+import { useSyncStore } from '@/stores/syncStore'
 import { BLEACH_LEVELS } from '@/types/coralRecord'
 import type { BleachLevel } from '@/types/coralRecord'
 import { BLEACH_COLOR } from '@/utils/bleach'
@@ -45,8 +47,9 @@ const route = useRoute()
 const router = useRouter()
 const reefStore = useReefStore()
 const surveyStore = useSurveyStore()
+const syncStore = useSyncStore()
 
-const EMPTY_COUNTS: CountMap = { reefs: 0, sites: 0, belts: 0, corals: 0, fishes: 0 }
+const EMPTY_COUNTS: CountMap = { reefs: 0, sites: 0, belts: 0, corals: 0, fishes: 0, outbox: 0, bleachGrades: 0, reefConclusions: 0, reconcileIssues: 0 }
 
 const counts = ref<CountMap>(EMPTY_COUNTS)
 const lastBackupAt = ref<string | null>(null)
@@ -56,6 +59,55 @@ const overwriteOnImport = ref(true)
 const fileList = ref<UploadFile[]>([])
 const busy = ref(false)
 const notice = ref('')
+
+// 分级组定级弹窗（分级份）
+const gradeDialogVisible = ref(false)
+const gradingBeltId = ref<string | null>(null)
+const gradingLevel = ref<BleachLevel>('无')
+const gradingConclusion = ref('')
+const gradingBelt = computed(() =>
+  gradingBeltId.value ? surveyStore.coverageRows.find((row) => row.beltId === gradingBeltId.value) ?? null : null
+)
+
+// 礁区结论弹窗（分级份）
+const conclusionDialogVisible = ref(false)
+const conclusionReefId = ref<string | null>(null)
+const conclusionText = ref('')
+const conclusionReef = computed(() =>
+  conclusionReefId.value ? reefStore.reefById(conclusionReefId.value) ?? null : null
+)
+
+function openGradeDialog(row: { beltId: string; grade: BleachLevel; officialGrade: BleachLevel; graded: boolean }): void {
+  gradingBeltId.value = row.beltId
+  gradingLevel.value = row.graded ? row.officialGrade : row.grade
+  gradingConclusion.value = syncStore.gradeForBelt(row.beltId)?.conclusion ?? ''
+  gradeDialogVisible.value = true
+}
+
+async function submitGrade(): Promise<void> {
+  if (!gradingBeltId.value) return
+  await syncStore.setBeltGrade(gradingBeltId.value, gradingLevel.value, gradingConclusion.value.trim())
+  ElMessage.success('分级定级已保存（分级份），外业份不被覆盖')
+  gradeDialogVisible.value = false
+}
+
+function openConclusionDialog(reefId: string): void {
+  conclusionReefId.value = reefId
+  conclusionText.value = syncStore.conclusionForReef(reefId)?.conclusion ?? ''
+  conclusionDialogVisible.value = true
+}
+
+function conclusionTime(reefId: string): string {
+  const stamp = syncStore.conclusionForReef(reefId)?.updatedAt
+  return stamp ? new Date(stamp).toLocaleString('zh-CN') : '未出具'
+}
+
+async function submitConclusion(): Promise<void> {
+  if (!conclusionReefId.value) return
+  await syncStore.setReefConclusion(conclusionReefId.value, conclusionText.value.trim())
+  ElMessage.success('礁区结论已保存（分级份）')
+  conclusionDialogVisible.value = false
+}
 
 const filterModel = computed<FilterModel>(() => ({
   keyword: surveyStore.filter.keyword,
@@ -356,10 +408,24 @@ onMounted(() => {
             <div class="gb-hint gb-mono">{{ row.coverCmTotal }} cm</div>
           </template>
         </el-table-column>
-        <el-table-column label="白化评定" width="170">
+        <el-table-column label="白化评定（分级份）" width="210">
           <template #default="{ row }">
-            <BleachTag :level="row.grade" size="small" />
-            <div class="gb-hint gb-mono">指数 {{ row.bleachIndex }} · 白化占比 {{ row.bleachedSharePct }}%</div>
+            <div class="grade-cell">
+              <BleachTag :level="row.officialGrade" size="small" />
+              <el-tag v-if="row.graded" size="small" type="success" effect="plain">分级已定级</el-tag>
+              <el-tag v-else size="small" type="info" effect="plain">外业初算</el-tag>
+            </div>
+            <div class="gb-hint gb-mono">外业覆盖指数 {{ row.bleachIndex }} · 白化占比 {{ row.bleachedSharePct }}%</div>
+            <div class="grade-cell__sync">
+              <SyncBadge
+                v-if="row.openIssueType"
+                :state="row.openIssueType === 'grade_conflict' ? 'conflict' : 'review'"
+                size="small"
+              />
+              <el-button size="small" text type="primary" @click="openGradeDialog(row)">
+                {{ row.graded ? '改级' : '定级' }}
+              </el-button>
+            </div>
           </template>
         </el-table-column>
         <el-table-column label="白化等级分布 (cm)" min-width="220">
@@ -438,6 +504,38 @@ onMounted(() => {
 
     <el-card shadow="never" class="gb-panel">
       <div class="gb-panel-title">
+        <h3>分级组礁区结论（分级份）</h3>
+        <span class="gb-hint">礁区结论由分级组出具，外业份不覆盖；已定级样带被外业改动后转待复核</span>
+      </div>
+      <EmptyPanel
+        v-if="reefStore.reefs.length === 0"
+        title="还没有礁区"
+        description="请先到礁区台账新建礁区。"
+        compact
+      />
+      <div v-else class="conclusion-grid">
+        <el-card v-for="reef in reefStore.reefs" :key="reef.id" shadow="hover" class="conclusion-card">
+          <div class="conclusion-card__head">
+            <strong>{{ reef.name }}</strong>
+            <el-tag size="small" effect="plain">{{ reef.protectStatus }}</el-tag>
+          </div>
+          <p class="conclusion-card__text">
+            {{ syncStore.conclusionForReef(reef.id)?.conclusion ?? '尚未出具礁区结论。' }}
+          </p>
+          <div class="conclusion-card__foot">
+            <span class="gb-hint">
+              {{ syncStore.conclusionForReef(reef.id)?.updatedBy ?? '—' }} · {{ conclusionTime(reef.id) }}
+            </span>
+            <el-button size="small" type="primary" plain @click="openConclusionDialog(reef.id)">
+              {{ syncStore.conclusionForReef(reef.id) ? '改结论' : '出具结论' }}
+            </el-button>
+          </div>
+        </el-card>
+      </div>
+    </el-card>
+
+    <el-card shadow="never" class="gb-panel">
+      <div class="gb-panel-title">
         <h3>结构版本与全量 JSON 导入导出</h3>
         <span class="gb-hint">
           导出内容包含 reefs / sites / belts / corals / fishes 五张表 · 最近备份
@@ -487,6 +585,60 @@ onMounted(() => {
         数据仅保存在当前浏览器 IndexedDB 中，换浏览器或清空站点数据后不会自动跟随，请通过 JSON 备份迁移。
       </p>
     </el-card>
+
+    <el-dialog v-model="gradeDialogVisible" :title="`分级定级 · 样带 ${gradingBelt?.beltNo ?? ''}`" width="560px" :close-on-click-modal="false">
+      <el-alert
+        type="info"
+        :closable="false"
+        show-icon
+        class="grade-dialog__tip"
+        title="分级组定级写入分级份，外业份的珊瑚覆盖记录不会被覆盖；已定级样带被外业改动后会转待复核 / 对账不符。"
+      />
+      <el-form label-width="110px" class="grade-dialog__form">
+        <el-form-item label="权威白化等级" required>
+          <el-radio-group v-model="gradingLevel">
+            <el-radio-button v-for="level in BLEACH_LEVELS" :key="level" :value="level">{{ level }}</el-radio-button>
+          </el-radio-group>
+        </el-form-item>
+        <el-form-item label="外业覆盖参考">
+          <span class="gb-hint">
+            外业覆盖指数 {{ gradingBelt?.bleachIndex }}（{{ gradingBelt?.grade }}）· 覆盖率 {{ gradingBelt?.coveragePct }}% ·
+            白化占比 {{ gradingBelt?.bleachedSharePct }}%
+          </span>
+        </el-form-item>
+        <el-form-item label="定级结论">
+          <el-input
+            v-model="gradingConclusion"
+            type="textarea"
+            :rows="3"
+            placeholder="如：该样带白化以轻-中度为主，建议加密复测；外业覆盖数据仅作参考。"
+            maxlength="200"
+          />
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="gradeDialogVisible = false">取消</el-button>
+        <el-button type="primary" @click="submitGrade">保存定级（分级份）</el-button>
+      </template>
+    </el-dialog>
+
+    <el-dialog v-model="conclusionDialogVisible" :title="`出具礁区结论 · ${conclusionReef?.name ?? ''}`" width="560px" :close-on-click-modal="false">
+      <el-form label-width="110px">
+        <el-form-item label="礁区结论" required>
+          <el-input
+            v-model="conclusionText"
+            type="textarea"
+            :rows="5"
+            placeholder="如：本礁区平均白化指数 1.2（轻），以鹿角珊瑚属为优势种，建议持续监测。"
+            maxlength="400"
+          />
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="conclusionDialogVisible = false">取消</el-button>
+        <el-button type="primary" @click="submitConclusion">保存结论（分级份）</el-button>
+      </template>
+    </el-dialog>
   </section>
 </template>
 
@@ -529,5 +681,54 @@ onMounted(() => {
 .page__mini-bar {
   display: block;
   height: 100%;
+}
+
+.grade-cell {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.grade-cell__sync {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 4px;
+}
+
+.conclusion-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+  gap: 12px;
+}
+
+.conclusion-card__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+
+.conclusion-card__text {
+  margin: 0 0 8px;
+  font-size: 13px;
+  line-height: 1.7;
+  color: #10312f;
+}
+
+.conclusion-card__foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.grade-dialog__tip {
+  margin-bottom: 12px;
+}
+
+.grade-dialog__form {
+  margin-top: 4px;
 }
 </style>
