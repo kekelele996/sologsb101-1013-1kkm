@@ -13,14 +13,13 @@ import FilterBar from '@/components/common/FilterBar.vue'
 import type { FilterModel } from '@/types/filter'
 import { buildQuery, queryToNumber } from '@/types/filter'
 import EmptyPanel from '@/components/common/EmptyPanel.vue'
-import BleachTag from '@/components/common/BleachTag.vue'
 import RouteMissingPanel from '@/components/common/RouteMissingPanel.vue'
 import { useReefStore } from '@/stores/reefStore'
 import { useBeltStore } from '@/stores/beltStore'
 import { useSurveyStore } from '@/stores/surveyStore'
+import { useGradingStore } from '@/stores/gradingStore'
 import { formatLatLng, SUBSTRATES, validateLatLng } from '@/types/site'
 import type { Site } from '@/types/site'
-import { bleachGrade, bleachIndex } from '@/utils/bleach'
 import { initDatabase } from '@/utils/db'
 
 const route = useRoute()
@@ -28,6 +27,7 @@ const router = useRouter()
 const reefStore = useReefStore()
 const beltStore = useBeltStore()
 const surveyStore = useSurveyStore()
+const gradingStore = useGradingStore()
 
 const reefId = computed(() => String(route.params.id ?? ''))
 const reef = computed(() => reefStore.reefById(reefId.value))
@@ -54,16 +54,25 @@ const rows = computed(() => {
   })
   return sites.map((site) => {
     const belts = beltStore.beltsOfSite(site.id)
-    const beltIds = new Set(belts.map((belt) => belt.id))
-    const corals = surveyStore.corals.filter((coral) => beltIds.has(coral.beltId))
-    const index = bleachIndex(corals)
+    const gradeRows = belts
+      .map((belt) => gradingStore.gradeOfBelt(belt.id))
+      .filter((row): row is NonNullable<typeof row> => Boolean(row))
+    const graded = gradeRows.filter((row) => row.status === '已定级')
+    const pending = gradeRows.filter((row) => row.status === '待复核').length
+    const conflict = gradeRows.filter((row) => row.status === '有分歧').length
+    const avg =
+      graded.length === 0
+        ? null
+        : Number((graded.reduce((sum, row) => sum + (row.bleachIndex ?? 0), 0) / graded.length).toFixed(2))
     return {
       site,
       beltCount: belts.length,
       beltLengthM: belts.reduce((sum, belt) => sum + belt.lengthM, 0),
-      coralCount: corals.length,
-      bleachIndex: index,
-      grade: bleachGrade(index)
+      coralCount: surveyStore.corals.filter((coral) => belts.some((belt) => belt.id === coral.beltId)).length,
+      gradedCount: graded.length,
+      pending,
+      conflict,
+      avgBleachIndex: avg
     }
   })
 })
@@ -298,15 +307,18 @@ onMounted(() => {
             </el-button>
           </template>
         </el-table-column>
-        <el-table-column label="珊瑚记录" width="110" align="right">
+        <el-table-column label="珊瑚覆盖" width="110" align="right">
           <template #default="{ row }">
             <span class="gb-mono">{{ row.coralCount }}</span>
           </template>
         </el-table-column>
-        <el-table-column label="平均白化" width="150">
+        <el-table-column label="分级账定级" width="210">
           <template #default="{ row }">
-            <BleachTag :level="row.grade" :size="'small'" />
-            <span class="gb-hint gb-mono"> {{ row.bleachIndex }}</span>
+            <span class="gb-mono">已定级 {{ row.gradedCount }}/{{ row.beltCount }}</span>
+            <el-tag v-if="row.pending > 0" size="small" type="warning" effect="plain" class="site-grade-flag">待复核 {{ row.pending }}</el-tag>
+            <el-tag v-if="row.conflict > 0" size="small" type="danger" effect="plain" class="site-grade-flag">分歧 {{ row.conflict }}</el-tag>
+            <div v-if="row.avgBleachIndex !== null" class="gb-hint gb-mono">平均指数 {{ row.avgBleachIndex }}</div>
+            <div v-else class="gb-hint">尚未定级</div>
           </template>
         </el-table-column>
         <el-table-column label="操作" width="240" fixed="right">
@@ -392,5 +404,9 @@ onMounted(() => {
 
 .page__full {
   width: 100%;
+}
+
+.site-grade-flag {
+  margin-left: 6px;
 }
 </style>

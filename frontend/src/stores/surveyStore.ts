@@ -1,59 +1,23 @@
 /**
- * 普查 store：维护珊瑚与鱼类筛选条件、录入草稿与覆盖度派生值。
- * 覆盖 /belts/:id/corals、/belts/:id/fishes 与 /coverage 三页。
+ * 普查 store（外业账）：维护珊瑚覆盖与鱼类计数的筛选、录入草稿。
+ * 覆盖 /belts/:id/corals、/belts/:id/fishes。
+ *
+ * v3 起白化等级不归外业：本 store 不再算等级 / 指数 / 分布，那些一律读分级组账（gradingStore）。
+ * 外业对珊瑚覆盖的任何增删改都进断网发件箱（syncStore），现场断网照旧记账、恢复后按样带对账。
  */
 import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
 import { db, createId, watchTable } from '@/utils/db'
-import type { BleachLevel, CoralForm, CoralRecord } from '@/types/coralRecord'
-import { BLEACH_LEVELS } from '@/types/coralRecord'
+import { useSyncStore } from '@/stores/syncStore'
+import type { CoralForm, CoralRecord } from '@/types/coralRecord'
 import type { CountCategory, FishCount, SizeClass } from '@/types/fishCount'
 import type { Reef } from '@/types/reef'
 import type { Site } from '@/types/site'
 import type { Belt } from '@/types/belt'
-import { bleachGrade, bleachIndex, bleachedSharePct, coralCoveragePct, fishDensity, round } from '@/utils/bleach'
+import { coralCoveragePct, round } from '@/utils/bleach'
 
-/** 覆盖度汇总页筛选条件 */
-export interface SurveyFilterState {
-  keyword: string
-  reefIds: string[]
-  bleachLevels: BleachLevel[]
-  /** 是否只看白化指数高于阈值的样带 */
-  onlyBleached: boolean
-}
-
-export function createEmptySurveyFilter(): SurveyFilterState {
-  return {
-    keyword: '',
-    reefIds: [],
-    bleachLevels: [],
-    onlyBleached: false
-  }
-}
-
-/** 覆盖度汇总行 */
-export interface CoverageSummaryRow {
-  beltId: string
-  beltNo: string
-  reefId: string
-  reefName: string
-  siteId: string
-  siteNo: string
-  lengthM: number
-  orientation: string
-  surveyDate: string
-  observer: string
-  coralCount: number
-  coverCmTotal: number
-  coveragePct: number
-  bleachIndex: number
-  grade: BleachLevel
-  bleachedSharePct: number
-  distribution: Record<BleachLevel, number>
-  fishTotal: number
-  invertebrateTotal: number
-  fishDensity: number
-}
+/** 外业珊瑚记录写入载荷（不含白化等级） */
+export type CoralInput = Omit<CoralRecord, 'id' | 'createdAt' | 'updatedAt' | 'beltId' | 'bleachLevel'>
 
 export const useSurveyStore = defineStore('survey', () => {
   const corals = ref<CoralRecord[]>([])
@@ -63,13 +27,11 @@ export const useSurveyStore = defineStore('survey', () => {
   const belts = ref<Belt[]>([])
   const ready = ref(false)
   const error = ref<string | null>(null)
-  const filter = ref<SurveyFilterState>(createEmptySurveyFilter())
-  /** 珊瑚录入草稿（跨页面保留） */
+  /** 珊瑚覆盖录入草稿（外业只录覆盖，白化等级去分级工作台定） */
   const coralDraft = ref({
     genus: '',
     form: '枝状' as CoralForm,
     coverCm: 100,
-    bleachLevel: '无' as BleachLevel,
     remark: ''
   })
   /** 鱼类计数草稿 */
@@ -104,17 +66,12 @@ export const useSurveyStore = defineStore('survey', () => {
     })
   }
 
-  /** 某样带的珊瑚记录（按白化等级降序、覆盖长度降序） */
+  /** 某样带的珊瑚覆盖记录（覆盖长度降序；等级不在外业账排序口径里） */
   function coralsOfBelt(beltId: string | null | undefined): CoralRecord[] {
     if (!beltId) return []
-    const order: Record<BleachLevel, number> = { 无: 0, 轻: 1, 中: 2, 重: 3, 死亡: 4 }
     return corals.value
       .filter((coral) => coral.beltId === beltId)
-      .sort((a, b) => {
-        const diff = order[b.bleachLevel] - order[a.bleachLevel]
-        if (diff !== 0) return diff
-        return b.coverCm - a.coverCm
-      })
+      .sort((a, b) => b.coverCm - a.coverCm)
   }
 
   /** 某样带的鱼类/无脊椎动物计数 */
@@ -137,8 +94,8 @@ export const useSurveyStore = defineStore('survey', () => {
     return counts
   })
 
-  /** 覆盖度汇总行（全部样带） */
-  const coverageRows = computed<CoverageSummaryRow[]>(() =>
+  /** 外业口径的样带覆盖行（只含覆盖率等外业指标；白化等级取分级账，见 gradingStore） */
+  const coverageRows = computed(() =>
     belts.value
       .map((belt) => {
         const site = sites.value.find((item) => item.id === belt.siteId)
@@ -149,14 +106,6 @@ export const useSurveyStore = defineStore('survey', () => {
           beltCorals.reduce((sum, coral) => sum + coral.coverCm, 0),
           1
         )
-        const distribution: Record<BleachLevel, number> = { 无: 0, 轻: 0, 中: 0, 重: 0, 死亡: 0 }
-        BLEACH_LEVELS.forEach((level) => {
-          distribution[level] = round(
-            beltCorals.filter((coral) => coral.bleachLevel === level).reduce((sum, coral) => sum + coral.coverCm, 0),
-            1
-          )
-        })
-        const index = bleachIndex(beltCorals)
         const fishTotal = beltFishes.filter((fish) => fish.category === '鱼类').reduce((sum, fish) => sum + fish.count, 0)
         return {
           beltId: belt.id,
@@ -172,77 +121,14 @@ export const useSurveyStore = defineStore('survey', () => {
           coralCount: beltCorals.length,
           coverCmTotal,
           coveragePct: coralCoveragePct(coverCmTotal, belt.lengthM),
-          bleachIndex: index,
-          grade: bleachGrade(index),
-          bleachedSharePct: bleachedSharePct(beltCorals),
-          distribution,
           fishTotal,
           invertebrateTotal: beltFishes
             .filter((fish) => fish.category === '无脊椎动物')
             .reduce((sum, fish) => sum + fish.count, 0),
-          fishDensity: fishDensity(fishTotal, belt.lengthM)
+          fishDensity: belt.lengthM > 0 ? round((fishTotal / belt.lengthM) * 100, 2) : 0
         }
       })
-      .sort((a, b) => b.bleachIndex - a.bleachIndex)
   )
-
-  /** 按筛选条件过滤后的覆盖度行 */
-  const filteredCoverageRows = computed<CoverageSummaryRow[]>(() =>
-    coverageRows.value.filter((row) => {
-      const keyword = filter.value.keyword.trim()
-      if (keyword.length > 0) {
-        const haystack = `${row.reefName}${row.siteNo}${row.beltNo}${row.observer}`
-        if (!haystack.includes(keyword)) return false
-      }
-      if (filter.value.reefIds.length > 0 && !filter.value.reefIds.includes(row.reefId)) return false
-      if (filter.value.bleachLevels.length > 0) {
-        const matched = filter.value.bleachLevels.some((level) => row.distribution[level] > 0)
-        if (!matched) return false
-      }
-      if (filter.value.onlyBleached && row.bleachedSharePct <= 0) return false
-      return true
-    })
-  )
-
-  const hasFilter = computed<boolean>(
-    () =>
-      filter.value.keyword.trim().length > 0 ||
-      filter.value.reefIds.length > 0 ||
-      filter.value.bleachLevels.length > 0 ||
-      filter.value.onlyBleached
-  )
-
-  /** 全局白化等级分布与总体指数 */
-  const globalStats = computed(() => {
-    const distribution: Record<BleachLevel, number> = { 无: 0, 轻: 0, 中: 0, 重: 0, 死亡: 0 }
-    BLEACH_LEVELS.forEach((level) => {
-      distribution[level] = round(
-        corals.value.filter((coral) => coral.bleachLevel === level).reduce((sum, coral) => sum + coral.coverCm, 0),
-        1
-      )
-    })
-    const index = bleachIndex(corals.value)
-    return {
-      coralCount: corals.value.length,
-      fishCount: fishes.value.length,
-      coverCmTotal: round(
-        corals.value.reduce((sum, coral) => sum + coral.coverCm, 0),
-        1
-      ),
-      bleachIndex: index,
-      grade: bleachGrade(index),
-      bleachedSharePct: bleachedSharePct(corals.value),
-      distribution
-    }
-  })
-
-  function patchFilter(patch: Partial<SurveyFilterState>): void {
-    filter.value = { ...filter.value, ...patch }
-  }
-
-  function resetFilter(): void {
-    filter.value = createEmptySurveyFilter()
-  }
 
   function patchCoralDraft(patch: Partial<typeof coralDraft.value>): void {
     coralDraft.value = { ...coralDraft.value, ...patch }
@@ -252,64 +138,64 @@ export const useSurveyStore = defineStore('survey', () => {
     fishDraft.value = { ...fishDraft.value, ...patch }
   }
 
-  /* ------------------------------ 珊瑚记录 ------------------------------ */
+  /* ------------------------------ 珊瑚覆盖（外业） ------------------------------ */
 
-  async function createCoral(
-    beltId: string,
-    payload: Omit<CoralRecord, 'id' | 'createdAt' | 'updatedAt' | 'beltId'>
-  ): Promise<CoralRecord> {
+  async function createCoral(beltId: string, payload: CoralInput): Promise<CoralRecord> {
     const now = Date.now()
-    const row: CoralRecord = { ...payload, beltId, id: createId('cor'), createdAt: now, updatedAt: now }
+    // bleachLevel 固定「无」占位：等级归分级账，外业写入不带任何等级语义
+    const row: CoralRecord = { ...payload, beltId, bleachLevel: '无', id: createId('cor'), createdAt: now, updatedAt: now }
     await db.corals.put(row)
+    await useSyncStore().enqueue('coral', row.id, 'upsert', beltId)
     return row
   }
 
-  async function updateCoral(id: string, patch: Partial<CoralRecord>): Promise<void> {
+  async function updateCoral(id: string, patch: Partial<CoralInput>): Promise<void> {
     await db.corals.update(id, { ...patch, updatedAt: Date.now() } as never)
+    const row = corals.value.find((coral) => coral.id === id)
+    await useSyncStore().enqueue('coral', id, 'upsert', row?.beltId)
   }
 
   async function removeCoral(id: string): Promise<void> {
+    const row = corals.value.find((coral) => coral.id === id)
+    const beltId = row?.beltId
     await db.corals.delete(id)
+    await useSyncStore().enqueue('coral', id, 'delete', beltId)
   }
 
-  /** 批量导入粘贴行（替换该样带原有珊瑚记录） */
+  /** 批量导入粘贴行（替换该样带原有珊瑚覆盖记录；白化等级一律不录） */
   async function importCoralRows(
     beltId: string,
-    rows: Array<{ genus: string; form: CoralForm; coverCm: number; bleachLevel: BleachLevel }>
+    rows: Array<{ genus: string; form: CoralForm; coverCm: number }>
   ): Promise<number> {
     const now = Date.now()
+    const sync = useSyncStore()
     const records: CoralRecord[] = rows.map((row, index) => ({
       id: createId('cor'),
       beltId,
       genus: row.genus,
       form: row.form,
       coverCm: row.coverCm,
-      bleachLevel: row.bleachLevel,
+      bleachLevel: '无',
       remark: '',
       createdAt: now + index,
       updatedAt: now + index
     }))
+    const oldIds = corals.value.filter((coral) => coral.beltId === beltId).map((coral) => coral.id)
     await db.transaction('rw', [db.corals], async () => {
       await db.corals.where('beltId').equals(beltId).delete()
       if (records.length > 0) await db.corals.bulkPut(records)
     })
+    // 旧记录删、新记录增都进箱；同箱内按实体合并，对账最终以整样带哈希为准
+    for (const oldId of oldIds) {
+      await sync.enqueue('coral', oldId, 'delete', beltId)
+    }
+    for (const record of records) {
+      await sync.enqueue('coral', record.id, 'upsert', beltId)
+    }
     return records.length
   }
 
-  /** 批量改写白化等级 */
-  async function bulkSetBleachLevel(ids: string[], bleachLevel: BleachLevel): Promise<number> {
-    const now = Date.now()
-    await db.corals
-      .where('id')
-      .anyOf(ids)
-      .modify((coral) => {
-        coral.bleachLevel = bleachLevel
-        coral.updatedAt = now
-      })
-    return ids.length
-  }
-
-  /* ------------------------------ 鱼类计数 ------------------------------ */
+  /* ------------------------------ 鱼类计数（外业） ------------------------------ */
 
   async function createFish(
     beltId: string,
@@ -380,27 +266,20 @@ export const useSurveyStore = defineStore('survey', () => {
     belts,
     ready,
     error,
-    filter,
     coralDraft,
     fishDraft,
     beltRecordCounts,
     coverageRows,
-    filteredCoverageRows,
-    hasFilter,
-    globalStats,
     start,
     coralsOfBelt,
     fishesOfBelt,
     fishSummaryOfBelt,
-    patchFilter,
-    resetFilter,
     patchCoralDraft,
     patchFishDraft,
     createCoral,
     updateCoral,
     removeCoral,
     importCoralRows,
-    bulkSetBleachLevel,
     createFish,
     updateFish,
     removeFish,

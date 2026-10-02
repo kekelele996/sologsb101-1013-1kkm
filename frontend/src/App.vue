@@ -5,10 +5,12 @@
  */
 import { computed, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { DataLine, Files, Grid, Odometer, PieChart } from '@element-plus/icons-vue'
+import { DataLine, DocumentChecked, Files, Grid, Odometer, PieChart, Promotion } from '@element-plus/icons-vue'
 import { useReefStore } from '@/stores/reefStore'
 import { useBeltStore } from '@/stores/beltStore'
 import { useSurveyStore } from '@/stores/surveyStore'
+import { useGradingStore } from '@/stores/gradingStore'
+import { useSyncStore } from '@/stores/syncStore'
 import { DB_NAME, DB_VERSION } from '@/utils/db'
 
 const route = useRoute()
@@ -16,11 +18,15 @@ const router = useRouter()
 const reefStore = useReefStore()
 const beltStore = useBeltStore()
 const surveyStore = useSurveyStore()
+const gradingStore = useGradingStore()
+const syncStore = useSyncStore()
 
 onMounted(() => {
   reefStore.start()
   beltStore.start()
   surveyStore.start()
+  gradingStore.start()
+  syncStore.start()
 })
 
 /** 层级路由统一归属到最上层导航项 */
@@ -33,7 +39,15 @@ const activeKey = computed(() => {
 
 const navItems = computed(() => [
   { key: '/reefs', label: '礁区台账', icon: Odometer, badge: String(reefStore.reefs.length) },
-  { key: '/coverage', label: '覆盖度汇总', icon: PieChart, badge: String(surveyStore.corals.length) }
+  { key: '/coverage', label: '外业覆盖度', icon: PieChart, badge: String(surveyStore.corals.length) },
+  {
+    key: '/grading',
+    label: '分级组工作台',
+    icon: DocumentChecked,
+    badge: syncStore.pendingCount + syncStore.openIssues.length > 0
+      ? `箱${syncStore.pendingCount}/裁${syncStore.openIssues.length}`
+      : String(gradingStore.beltGrades.length)
+  }
 ])
 
 /** 当前上下文的快捷入口：礁区 → 站位 → 样带 → 珊瑚/鱼类 */
@@ -51,10 +65,15 @@ const contextLinks = computed(() => {
   if (route.path.startsWith('/belts/') && id) {
     const belt = beltStore.beltById(id)
     if (belt) links.push({ label: '所属站位样带', path: `/sites/${belt.siteId}/belts` })
-    links.push({ label: '珊瑚计数', path: `/belts/${id}/corals` })
+    links.push({ label: '珊瑚覆盖', path: `/belts/${id}/corals` })
     links.push({ label: '鱼类计数', path: `/belts/${id}/fishes` })
+    links.push({ label: '去分级组定级', path: '/grading' })
   }
   if (route.path.startsWith('/coverage')) links.push({ label: '礁区台账', path: '/reefs' })
+  if (route.path.startsWith('/grading')) {
+    links.push({ label: '外业覆盖度', path: '/coverage' })
+    links.push({ label: '礁区台账', path: '/reefs' })
+  }
   return links
 })
 
@@ -70,10 +89,15 @@ function go(path: string): void {
         <span class="app-header__mark">珊</span>
         <div>
           <h1 class="app-header__title">珊瑚礁样带普查与白化分级台</h1>
-          <p class="app-header__sub">礁区 · 站位 · 样带 · 珊瑚分类覆盖 · 白化分级 · 鱼类计数</p>
+          <p class="app-header__sub">外业队管样带与珊瑚覆盖 · 分级组管白化等级与礁区结论 · 断网发件箱对账</p>
         </div>
       </div>
       <nav class="app-nav">
+        <span class="app-nav__net" :class="syncStore.online ? 'is-online' : 'is-offline'">
+          <el-icon><Promotion /></el-icon>
+          {{ syncStore.online ? '在线' : '断网记账中' }}
+          <em v-if="syncStore.pendingCount > 0" class="app-nav__net-badge">发件箱 {{ syncStore.pendingCount }}</em>
+        </span>
         <button
           v-for="item in navItems"
           :key="item.key"
@@ -107,8 +131,12 @@ function go(path: string): void {
         本地库 {{ DB_NAME }} · 结构版本 v{{ DB_VERSION }} · 数据仅存于本浏览器 IndexedDB，不上传任何服务器。
       </span>
       <span>
-        礁区 {{ reefStore.reefs.length }} · 站位 {{ reefStore.sites.length }} · 样带 {{ beltStore.belts.length }} · 珊瑚记录
-        {{ surveyStore.corals.length }} · 计数记录 {{ surveyStore.fishes.length }}
+        外业账：礁区 {{ reefStore.reefs.length }} · 站位 {{ reefStore.sites.length }} · 样带 {{ beltStore.belts.length }}
+        · 珊瑚覆盖 {{ surveyStore.corals.length }} · 计数 {{ surveyStore.fishes.length }}
+        ｜分级账：定级 {{ gradingStore.beltGrades.filter((row) => row.status === '已定级').length }}
+        · 待复核 {{ gradingStore.beltGrades.filter((row) => row.status === '待复核').length }}
+        · 分歧 {{ gradingStore.beltGrades.filter((row) => row.status === '有分歧').length }}
+        · 礁区结论 {{ gradingStore.reefConclusions.length }}
       </span>
     </footer>
   </div>
@@ -166,7 +194,37 @@ function go(path: string): void {
 .app-nav {
   display: flex;
   flex-wrap: wrap;
+  align-items: center;
   gap: 8px;
+}
+
+.app-nav__net {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 6px 12px;
+  border-radius: 999px;
+  font-size: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.22);
+}
+
+.app-nav__net.is-online {
+  background: rgba(255, 255, 255, 0.1);
+  color: #d9fff5;
+}
+
+.app-nav__net.is-offline {
+  background: rgba(255, 196, 120, 0.22);
+  color: #ffe2bd;
+  border-color: rgba(255, 200, 140, 0.55);
+}
+
+.app-nav__net-badge {
+  font-style: normal;
+  margin-left: 2px;
+  padding: 0 6px;
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.22);
 }
 
 .app-nav__item {

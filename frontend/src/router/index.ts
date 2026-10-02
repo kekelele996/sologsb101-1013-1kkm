@@ -3,6 +3,7 @@ import { createRouter, createWebHistory, type RouteRecordRaw } from 'vue-router'
 /**
  * 路由表：路径与提示词逐字一致。
  * /reefs、/reefs/:id/sites、/sites/:id/belts、/belts/:id/corals、/belts/:id/fishes、/coverage
+ * 另增 /grading 分级组工作台（白化定级、对账裁定、礁区结论）。
  * 全部页面懒加载，构建时自动分包。
  */
 const routes: RouteRecordRaw[] = [
@@ -42,6 +43,12 @@ const routes: RouteRecordRaw[] = [
     name: 'coverage-view',
     component: () => import('@/pages/CoverageView.vue'),
     meta: { title: '白化等级评定与覆盖度汇总', icon: 'PieChart' }
+  },
+  {
+    path: '/grading',
+    name: 'grading-board',
+    component: () => import('@/pages/GradingBoard.vue'),
+    meta: { title: '分级组工作台', icon: 'DocumentChecked' }
   },
   { path: '/:pathMatch(.*)*', redirect: '/reefs' }
 ]

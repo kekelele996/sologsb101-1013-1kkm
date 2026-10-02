@@ -5,11 +5,11 @@
 import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
 import { db, createId, readLastReefId, watchTable, writeLastReefId } from '@/utils/db'
+import { useSyncStore } from '@/stores/syncStore'
 import type { Reef, ReefFilterState } from '@/types/reef'
 import { createEmptyReefFilter } from '@/types/reef'
 import type { Site, SiteFilterState } from '@/types/site'
 import { createEmptySiteFilter } from '@/types/site'
-import { bleachIndex, round } from '@/utils/bleach'
 
 export const useReefStore = defineStore('reef', () => {
   const reefs = ref<Reef[]>([])
@@ -145,19 +145,25 @@ export const useReefStore = defineStore('reef', () => {
     const now = Date.now()
     const row: Reef = { ...payload, id: createId('reef'), createdAt: now, updatedAt: now }
     await db.reefs.put(row)
+    await useSyncStore().enqueue('reef', row.id, 'upsert')
     return row
   }
 
   async function updateReef(id: string, patch: Partial<Reef>): Promise<void> {
     await db.reefs.update(id, { ...patch, updatedAt: Date.now() } as never)
+    await useSyncStore().enqueue('reef', id, 'upsert')
   }
 
-  /** 删除礁区：级联删除其站位、样带、珊瑚记录与鱼类计数 */
+  /**
+   * 删除礁区：级联删除外业账的站位、样带、珊瑚记录与鱼类计数（分级账不碰）。
+   * 删除事件进发件箱；网络恢复对账时，礁区结论与相关定级若仍存在会挂分歧等人定。
+   */
   async function removeReef(id: string): Promise<void> {
+    let beltIds: string[] = []
     await db.transaction('rw', [db.reefs, db.sites, db.belts, db.corals, db.fishes], async () => {
       const siteIds = (await db.sites.where('reefId').equals(id).toArray()).map((row) => row.id)
       if (siteIds.length > 0) {
-        const beltIds = (await db.belts.where('siteId').anyOf(siteIds).toArray()).map((row) => row.id)
+        beltIds = (await db.belts.where('siteId').anyOf(siteIds).toArray()).map((row) => row.id)
         if (beltIds.length > 0) {
           await db.corals.where('beltId').anyOf(beltIds).delete()
           await db.fishes.where('beltId').anyOf(beltIds).delete()
@@ -167,6 +173,11 @@ export const useReefStore = defineStore('reef', () => {
       }
       await db.reefs.delete(id)
     })
+    const sync = useSyncStore()
+    await sync.enqueue('reef', id, 'delete')
+    for (const beltId of beltIds) {
+      await sync.enqueue('belt', beltId, 'delete', beltId)
+    }
     if (currentReefId.value === id) selectReef(null)
   }
 
@@ -176,17 +187,20 @@ export const useReefStore = defineStore('reef', () => {
     const now = Date.now()
     const row: Site = { ...payload, id: createId('site'), createdAt: now, updatedAt: now }
     await db.sites.put(row)
+    await useSyncStore().enqueue('site', row.id, 'upsert')
     return row
   }
 
   async function updateSite(id: string, patch: Partial<Site>): Promise<void> {
     await db.sites.update(id, { ...patch, updatedAt: Date.now() } as never)
+    await useSyncStore().enqueue('site', id, 'upsert')
   }
 
-  /** 删除站位：级联删除其样带、珊瑚记录与鱼类计数 */
+  /** 删除站位：级联删除外业账的样带、珊瑚记录与鱼类计数（分级账由对账裁定） */
   async function removeSite(id: string): Promise<void> {
+    let beltIds: string[] = []
     await db.transaction('rw', [db.sites, db.belts, db.corals, db.fishes], async () => {
-      const beltIds = (await db.belts.where('siteId').equals(id).toArray()).map((row) => row.id)
+      beltIds = (await db.belts.where('siteId').equals(id).toArray()).map((row) => row.id)
       if (beltIds.length > 0) {
         await db.corals.where('beltId').anyOf(beltIds).delete()
         await db.fishes.where('beltId').anyOf(beltIds).delete()
@@ -194,22 +208,12 @@ export const useReefStore = defineStore('reef', () => {
       }
       await db.sites.delete(id)
     })
-    if (currentSiteId.value === id) selectSite(null)
-  }
-
-  /** 站位 id → 样带数与平均白化指数（列表回显用） */
-  async function siteBleachAverages(): Promise<Record<string, number>> {
-    const result: Record<string, number> = {}
-    for (const site of sites.value) {
-      const beltIds = (await db.belts.where('siteId').equals(site.id).toArray()).map((row) => row.id)
-      if (beltIds.length === 0) {
-        result[site.id] = 0
-        continue
-      }
-      const corals = await db.corals.where('beltId').anyOf(beltIds).toArray()
-      result[site.id] = round(bleachIndex(corals), 2)
+    const sync = useSyncStore()
+    await sync.enqueue('site', id, 'delete')
+    for (const beltId of beltIds) {
+      await sync.enqueue('belt', beltId, 'delete', beltId)
     }
-    return result
+    if (currentSiteId.value === id) selectSite(null)
   }
 
   return {
@@ -242,7 +246,6 @@ export const useReefStore = defineStore('reef', () => {
     removeReef,
     createSite,
     updateSite,
-    removeSite,
-    siteBleachAverages
+    removeSite
   }
 })

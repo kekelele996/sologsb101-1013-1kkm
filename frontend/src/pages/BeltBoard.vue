@@ -11,13 +11,15 @@ import { Delete, Edit, Plus, Right, Warning } from '@element-plus/icons-vue'
 import StatBadge from '@/components/common/StatBadge.vue'
 import EmptyPanel from '@/components/common/EmptyPanel.vue'
 import BleachTag from '@/components/common/BleachTag.vue'
+import GradeStatusTag from '@/components/common/GradeStatusTag.vue'
 import RouteMissingPanel from '@/components/common/RouteMissingPanel.vue'
 import { useReefStore } from '@/stores/reefStore'
 import { ORIENTATION_ORDER, useBeltStore } from '@/stores/beltStore'
 import { useSurveyStore } from '@/stores/surveyStore'
+import { useGradingStore } from '@/stores/gradingStore'
 import { BELT_LENGTH_PRESETS, ORIENTATIONS } from '@/types/belt'
 import type { Belt, Orientation } from '@/types/belt'
-import { bleachGrade, bleachIndex, coralCoveragePct, fishDensity } from '@/utils/bleach'
+import { coralCoveragePct, fishDensity } from '@/utils/bleach'
 import { initDatabase } from '@/utils/db'
 
 const route = useRoute()
@@ -25,6 +27,7 @@ const router = useRouter()
 const reefStore = useReefStore()
 const beltStore = useBeltStore()
 const surveyStore = useSurveyStore()
+const gradingStore = useGradingStore()
 
 const siteId = computed(() => String(route.params.id ?? ''))
 const site = computed(() => reefStore.siteById(siteId.value))
@@ -41,22 +44,23 @@ const form = reactive({
   observer: ''
 })
 
-/** 样带行：回显珊瑚记录数、鱼类记录数、覆盖率与白化指数 */
+/** 样带行：回显珊瑚覆盖数、鱼类记录数、覆盖率（外业）与分级账定级（只读） */
 const rows = computed(() =>
   beltStore.beltsOfSite(siteId.value).map((belt) => {
     const corals = surveyStore.coralsOfBelt(belt.id)
     const fishes = surveyStore.fishesOfBelt(belt.id)
     const coverCmTotal = corals.reduce((sum, coral) => sum + coral.coverCm, 0)
-    const index = bleachIndex(corals)
     const fishTotal = fishes.filter((fish) => fish.category === '鱼类').reduce((sum, fish) => sum + fish.count, 0)
+    const gradeRow = gradingStore.gradeOfBelt(belt.id)
     return {
       belt,
       coralCount: corals.length,
       fishCount: fishes.length,
       coverCmTotal,
       coveragePct: coralCoveragePct(coverCmTotal, belt.lengthM),
-      bleachIndex: index,
-      grade: bleachGrade(index),
+      gradeStatus: gradeRow?.status ?? '未定级',
+      grade: gradeRow?.grade ?? null,
+      bleachIndex: gradeRow?.bleachIndex ?? null,
       fishDensity: fishDensity(fishTotal, belt.lengthM)
     }
   })
@@ -190,6 +194,10 @@ function gotoFishes(belt: Belt): void {
   void router.push(`/belts/${belt.id}/fishes`)
 }
 
+function gotoGrading(): void {
+  void router.push('/grading')
+}
+
 onMounted(() => {
   if (reefStore.reefs.length === 0) void initDatabase()
   if (site.value) reefStore.selectSite(site.value.id)
@@ -301,16 +309,21 @@ onMounted(() => {
             <div class="gb-hint gb-mono">{{ row.coverCmTotal }} cm</div>
           </template>
         </el-table-column>
-        <el-table-column label="白化" width="150">
+        <el-table-column label="分级账定级（只读）" width="170">
           <template #default="{ row }">
-            <BleachTag :level="row.grade" size="small" />
-            <div class="gb-hint gb-mono">指数 {{ row.bleachIndex }}</div>
+            <GradeStatusTag :status="row.gradeStatus" size="small" />
+            <div class="grade-cell">
+              <BleachTag v-if="row.grade" :level="row.grade" size="small" />
+              <span v-else class="gb-hint">未定级</span>
+              <span v-if="row.bleachIndex !== null" class="gb-hint gb-mono"> 指数 {{ row.bleachIndex }}</span>
+            </div>
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="260" fixed="right">
+        <el-table-column label="操作" width="320" fixed="right">
           <template #default="{ row }">
             <el-button size="small" type="primary" :icon="Right" @click="gotoCorals(row.belt)">珊瑚</el-button>
             <el-button size="small" @click="gotoFishes(row.belt)">鱼类</el-button>
+            <el-button size="small" @click="gotoGrading">定级</el-button>
             <el-button size="small" :icon="Edit" @click="openEdit(row.belt)">编辑</el-button>
             <el-button size="small" type="danger" plain :icon="Delete" @click="removeBelt(row.belt)">删除</el-button>
           </template>
@@ -405,6 +418,13 @@ onMounted(() => {
   display: flex;
   flex-wrap: wrap;
   gap: 2px;
+  margin-top: 4px;
+}
+
+.grade-cell {
+  display: flex;
+  align-items: center;
+  gap: 4px;
   margin-top: 4px;
 }
 </style>

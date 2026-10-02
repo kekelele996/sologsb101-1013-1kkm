@@ -17,9 +17,10 @@ import EmptyPanel from '@/components/common/EmptyPanel.vue'
 import { useReefStore } from '@/stores/reefStore'
 import { useBeltStore } from '@/stores/beltStore'
 import { useSurveyStore } from '@/stores/surveyStore'
+import { useGradingStore } from '@/stores/gradingStore'
 import { AREA_BUCKETS, createEmptyReefFilter, PROTECT_STATUSES } from '@/types/reef'
 import type { ProtectStatus, Reef } from '@/types/reef'
-import { bleachGrade, bleachIndex } from '@/utils/bleach'
+import { bleachGrade } from '@/utils/bleach'
 import { initDatabase } from '@/utils/db'
 
 const route = useRoute()
@@ -27,6 +28,7 @@ const router = useRouter()
 const reefStore = useReefStore()
 const beltStore = useBeltStore()
 const surveyStore = useSurveyStore()
+const gradingStore = useGradingStore()
 
 const dialogVisible = ref(false)
 const editingId = ref<string | null>(null)
@@ -40,7 +42,7 @@ const form = reactive({
   manager: ''
 })
 
-/** 礁区卡片：汇总站位/样带/珊瑚记录数与平均白化指数 */
+/** 礁区卡片：汇总站位/样带/珊瑚覆盖数与分级账定级（外业不算白化） */
 const cards = computed(() =>
   reefStore.filteredReefs.map((reef: Reef) => {
     const sites = reefStore.sites.filter((site) => site.reefId === reef.id)
@@ -49,15 +51,29 @@ const cards = computed(() =>
     const beltIds = new Set(belts.map((belt) => belt.id))
     const corals = surveyStore.corals.filter((coral) => beltIds.has(coral.beltId))
     const fishes = surveyStore.fishes.filter((fish) => beltIds.has(fish.beltId))
-    const index = bleachIndex(corals)
+    const gradeRows = belts
+      .map((belt) => gradingStore.gradeOfBelt(belt.id))
+      .filter((row): row is NonNullable<typeof row> => Boolean(row))
+    const graded = gradeRows.filter((row) => row.status === '已定级')
+    const pending = gradeRows.filter((row) => row.status === '待复核').length
+    const conflict = gradeRows.filter((row) => row.status === '有分歧').length
+    const avg =
+      graded.length === 0
+        ? null
+        : Number((graded.reduce((sum, row) => sum + (row.bleachIndex ?? 0), 0) / graded.length).toFixed(2))
+    const conclusion = gradingStore.conclusionOfReef(reef.id)
     return {
       reef,
       siteCount: sites.length,
       beltCount: belts.length,
       coralCount: corals.length,
       fishTotal: fishes.reduce((sum, fish) => sum + fish.count, 0),
-      bleachIndex: index,
-      grade: bleachGrade(index)
+      gradedCount: graded.length,
+      pending,
+      conflict,
+      avgBleachIndex: avg,
+      grade: avg === null ? null : bleachGrade(avg),
+      conclusion
     }
   })
 )
@@ -74,10 +90,17 @@ const totals = computed(() => ({
   sites: cards.value.reduce((sum, card) => sum + card.siteCount, 0),
   belts: cards.value.reduce((sum, card) => sum + card.beltCount, 0),
   corals: cards.value.reduce((sum, card) => sum + card.coralCount, 0),
+  graded: cards.value.reduce((sum, card) => sum + card.gradedCount, 0),
+  pending: cards.value.reduce((sum, card) => sum + card.pending, 0),
   avgBleachIndex:
-    cards.value.length === 0
+    cards.value.filter((card) => card.avgBleachIndex !== null).length === 0
       ? 0
-      : Number((cards.value.reduce((sum, card) => sum + card.bleachIndex, 0) / cards.value.length).toFixed(2))
+      : Number(
+          (
+            cards.value.reduce((sum, card) => sum + (card.avgBleachIndex ?? 0), 0) /
+            cards.value.filter((card) => card.avgBleachIndex !== null).length
+          ).toFixed(2)
+        )
 }))
 
 async function syncQuery(): Promise<void> {
@@ -247,14 +270,9 @@ watch(
       <StatBadge label="筛选后礁区" :value="totals.reefs" suffix="个" icon="Odometer" />
       <StatBadge label="站位总数" :value="totals.sites" suffix="个" tone="info" icon="Grid" />
       <StatBadge label="样带总数" :value="totals.belts" suffix="条" tone="success" icon="Files" />
-      <StatBadge label="珊瑚记录" :value="totals.corals" suffix="条" icon="Histogram" />
-      <StatBadge
-        label="平均白化指数"
-        :value="totals.avgBleachIndex"
-        suffix="/ 4"
-        :tone="totals.avgBleachIndex > 1 ? 'warning' : 'success'"
-        :icon="totals.avgBleachIndex > 1 ? 'WarningFilled' : 'DataLine'"
-      />
+      <StatBadge label="珊瑚覆盖记录" :value="totals.corals" suffix="条" icon="Histogram" />
+      <StatBadge label="已定级样带" :value="totals.graded" suffix="条" tone="success" icon="CircleCheck" />
+      <StatBadge label="待复核样带" :value="totals.pending" suffix="条" tone="warning" icon="Refresh" />
     </div>
 
     <EmptyPanel
@@ -279,29 +297,40 @@ watch(
               <strong class="reef-card__name">{{ card.reef.name }}</strong>
               <el-tag size="small" effect="plain" class="reef-card__status">{{ card.reef.protectStatus }}</el-tag>
             </div>
-            <BleachTag :level="card.grade" size="small" />
+            <BleachTag v-if="card.grade" :level="card.grade" size="small" />
+            <el-tag v-else size="small" type="info">未全部定级</el-tag>
           </div>
         </template>
 
         <div class="reef-card__stats">
           <StatBadge label="站位" :value="card.siteCount" suffix="个" size="small" tone="info" icon="Grid" />
           <StatBadge label="样带" :value="card.beltCount" suffix="条" size="small" icon="Files" />
-          <StatBadge label="珊瑚记录" :value="card.coralCount" suffix="条" size="small" tone="success" icon="Histogram" />
+          <StatBadge label="覆盖记录" :value="card.coralCount" suffix="条" size="small" tone="success" icon="Histogram" />
           <StatBadge
-            label="白化指数"
-            :value="card.bleachIndex"
-            suffix="/ 4"
+            label="已定级 / 待复核"
+            :value="`${card.gradedCount} / ${card.pending}`"
             size="small"
-            :tone="card.bleachIndex > 1 ? 'warning' : 'success'"
-            icon="TrendCharts"
+            :tone="card.pending > 0 || card.conflict > 0 ? 'warning' : 'success'"
+            icon="DocumentChecked"
           />
         </div>
 
         <div class="reef-card__meta">
           <span>面积 <b class="gb-mono">{{ card.reef.areaKm2 }}</b> km²</span>
           <span>鱼获计数 <b class="gb-mono">{{ card.fishTotal }}</b></span>
+          <span v-if="card.avgBleachIndex !== null">分级账平均指数 <b class="gb-mono">{{ card.avgBleachIndex }}</b> / 4</span>
           <span v-if="card.reef.manager">管理单位：{{ card.reef.manager }}</span>
         </div>
+
+        <p v-if="card.conclusion" class="reef-card__conclusion">
+          <el-tag size="small" type="success" effect="plain">分级组礁区结论</el-tag>
+          {{ card.conclusion.conclusion }}
+        </p>
+        <p v-if="card.pending > 0 || card.conflict > 0" class="reef-card__warn">
+          <el-tag size="small" type="warning" effect="plain">待复核 {{ card.pending }}</el-tag>
+          <el-tag size="small" type="danger" effect="plain">分歧 {{ card.conflict }}</el-tag>
+          白化等级需分级组复核后才能对外上报
+        </p>
 
         <p v-if="card.reef.location" class="reef-card__location">{{ card.reef.location }}</p>
 
@@ -428,6 +457,27 @@ watch(
   font-size: 12px;
   color: #7c9995;
   line-height: 1.7;
+}
+
+.reef-card__conclusion {
+  margin: 8px 0 0;
+  padding: 8px 10px;
+  background: #f0f8f4;
+  border-left: 3px solid #1e8449;
+  border-radius: 6px;
+  font-size: 12px;
+  line-height: 1.7;
+  color: #2c4a44;
+}
+
+.reef-card__warn {
+  margin: 6px 0 0;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: #a15c07;
 }
 
 .reef-card__actions {

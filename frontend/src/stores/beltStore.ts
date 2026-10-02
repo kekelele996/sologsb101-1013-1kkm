@@ -5,6 +5,7 @@
 import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
 import { db, createId, watchTable } from '@/utils/db'
+import { useSyncStore } from '@/stores/syncStore'
 import type { Belt, BeltDraft, Orientation } from '@/types/belt'
 import { ORIENTATIONS, createEmptyBeltDraft } from '@/types/belt'
 
@@ -105,33 +106,44 @@ export const useBeltStore = defineStore('belt', () => {
     const now = Date.now()
     const row: Belt = { ...payload, siteId, id: createId('belt'), createdAt: now, updatedAt: now }
     await db.belts.put(row)
+    // 现场断网也记账：先进发件箱，网络恢复后按样带编号与分级组对账
+    await useSyncStore().enqueue('belt', row.id, 'upsert', row.id)
     return row
   }
 
   async function updateBelt(id: string, patch: Partial<Belt>): Promise<void> {
     await db.belts.update(id, { ...patch, updatedAt: Date.now() } as never)
+    await useSyncStore().enqueue('belt', id, 'upsert', id)
   }
 
-  /** 删除样带：级联删除其珊瑚记录与鱼类计数 */
+  /** 删除样带：级联删除其珊瑚记录与鱼类计数；删除事件进发件箱交分级账裁定 */
   async function removeBelt(id: string): Promise<void> {
     await db.transaction('rw', [db.belts, db.corals, db.fishes], async () => {
       await db.corals.where('beltId').equals(id).delete()
       await db.fishes.where('beltId').equals(id).delete()
       await db.belts.delete(id)
     })
+    await useSyncStore().enqueue('belt', id, 'delete', id)
     if (currentBeltId.value === id) selectBelt(null)
   }
 
   /** 批量改写朝向（同站位多条样带统一方向） */
   async function bulkSetOrientation(ids: string[], orientation: Orientation): Promise<number> {
     const now = Date.now()
-    await db.belts
-      .where('id')
-      .anyOf(ids)
-      .modify((belt) => {
-        belt.orientation = orientation
-        belt.updatedAt = now
-      })
+    await db.transaction('rw', [db.belts], async () => {
+      await db.belts
+        .where('id')
+        .anyOf(ids)
+        .modify((belt) => {
+          belt.orientation = orientation
+          belt.updatedAt = now
+        })
+    })
+    // 逐条入箱（按实体合并），保证每条样带都参与对账
+    const sync = useSyncStore()
+    for (const id of ids) {
+      await sync.enqueue('belt', id, 'upsert', id)
+    }
     return ids.length
   }
 
